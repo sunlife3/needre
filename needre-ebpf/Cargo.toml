@@ -1,0 +1,17 @@
+[package]
+name = "needre-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+needre-common = { path = "../needre-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "needre"
+path = "src/main.rs"
