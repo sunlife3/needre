@@ -1,0 +1,13 @@
+[Unit]
+Description=Needre EDR Daemon
+After=sysinit.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p /var/log/needre
+ExecStart=/usr/local/bin/needre
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,14 +1,29 @@
+use aya::maps::RingBuf;
 use aya::programs::TracePoint;
-#[rustfmt::skip]
-use log::{debug, warn};
+use chrono::Local;
+use std::convert::TryFrom;
+use std::ffi::CStr;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+
+use needre_common::ProcessEvent;
+
+use log::{debug, info, warn};
+use tokio::io::unix::AsyncFd;
 use tokio::signal;
+use tokio::signal::unix::{SignalKind, signal as unix_signal};
+
+const SUSPICIOUS_PREFIXES: &[&str] = &["/tmp"];
+const DETECT_LOG_PATH: &str = "/var/log/needre/needre_detect.log";
+
+fn suspicious_prefix(path: &str) -> Option<&'static str> {
+    SUSPICIOUS_PREFIXES.iter().copied().find(|&p| path.starts_with(p))
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
 
-    // Bump the memlock rlimit. This is needed for older kernels that don't use the
-    // new memcg based accounting, see https://lwn.net/Articles/837122/
     let rlim = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
         rlim_max: libc::RLIM_INFINITY,
@@ -18,22 +33,23 @@ async fn main() -> anyhow::Result<()> {
         debug!("remove limit on locked memory failed, ret is: {ret}");
     }
 
-    // This will include your eBPF object file as raw bytes at compile-time and load it at
-    // runtime. This approach is recommended for most real-world use cases. If you would
-    // like to specify the eBPF program at runtime rather than at compile-time, you can
-    // reach for `Bpf::load_file` instead.
+    fs::create_dir_all("/var/log/needre")?;
+    let mut detect_log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(DETECT_LOG_PATH)?;
+
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/needre"
     )))?;
     match aya_log::EbpfLogger::init(&mut ebpf) {
         Err(e) => {
-            // This can happen if you remove all log statements from your eBPF program.
             warn!("failed to initialize eBPF logger: {e}");
         }
         Ok(logger) => {
             let mut logger =
-                tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)?;
+                AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)?;
             tokio::task::spawn(async move {
                 loop {
                     let mut guard = logger.readable_mut().await.unwrap();
@@ -43,14 +59,46 @@ async fn main() -> anyhow::Result<()> {
             });
         }
     }
+
     let program: &mut TracePoint = ebpf.program_mut("needre").unwrap().try_into()?;
     program.load()?;
-    program.attach("syscalls", "execve")?;
+    program.attach("syscalls", "sys_enter_execve")?;
 
-    let ctrl_c = signal::ctrl_c();
-    println!("Waiting for Ctrl-C...");
-    ctrl_c.await?;
-    println!("Exiting...");
+    let ring = RingBuf::try_from(ebpf.map_mut("EVENTS").unwrap())?;
+    let mut ring_fd = AsyncFd::new(ring)?;
+    let mut sigterm = unix_signal(SignalKind::terminate())?;
 
+    info!("needre started");
+    loop {
+        tokio::select! {
+            _ = signal::ctrl_c() => break,
+            _ = sigterm.recv() => break,
+            result = ring_fd.readable_mut() => {
+                let mut guard = result?;
+                while let Some(item) = guard.get_inner_mut().next() {
+                    let event = unsafe { &*(item.as_ptr() as *const ProcessEvent) };
+                    let comm = CStr::from_bytes_until_nul(&event.comm)
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let path = CStr::from_bytes_until_nul(&event.filename)
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+
+                    info!("[EXECVE] pid={} tgid={} uid={} comm=\"{}\" path=\"{}\"",
+                        event.pid, event.tgid, event.uid, comm, path);
+
+                    if let Some(prefix) = suspicious_prefix(&path) {
+                        let ts = Local::now().format("%Y-%m-%d %H:%M:%S");
+                        writeln!(detect_log,
+                            "{} [DETECT] execution from {} | pid={} tgid={} uid={} comm=\"{}\" path=\"{}\"",
+                            ts, prefix, event.pid, event.tgid, event.uid, comm, path).ok();
+                    }
+                }
+                guard.clear_ready();
+            }
+        }
+    }
+
+    info!("needre shutting down");
     Ok(())
 }
