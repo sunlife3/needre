@@ -5,7 +5,7 @@ A self-made EDR program that runs on Linux. Implemented with [Aya](https://aya-r
 - Detects execution from suspicious path prefixes (default: `/tmp`).
 
 ## Other features
-- Records timestamped detection entries to `/var/log/needre/needre_detect.log`.
+- Records detection entries to `/var/log/needre/needre_detect.log`.
 - Sends all audit logs to journald (`info` level).
 - Runs as a systemd service.
 
