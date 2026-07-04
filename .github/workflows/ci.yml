@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Build & test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Nightly is required to compile needre-ebpf for bpfel-unknown-none via
+      # `-Z build-std` (driven by needre's build.rs). rust-src provides the std
+      # sources build-std needs.
+      - name: Install Rust nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: bpfel-unknown-none
+          components: rust-src
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      # bpf-linker links the eBPF object emitted for the bpfel-unknown-none
+      # target. Without it, needre's build.rs cannot produce the bytecode.
+      - name: Install bpf-linker
+        run: cargo install bpf-linker --locked
+
+      # Uses the workspace default-members (needre + needre-common), which
+      # excludes the no_std/no_main needre-ebpf crate that can't be tested on
+      # the host. This includes the config.rs unit tests (`config::tests::*`)
+      # that validate the config-file parser.
+      - name: Run tests
+        run: cargo test --verbose

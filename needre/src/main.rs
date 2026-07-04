@@ -14,12 +14,10 @@ use tokio::io::unix::AsyncFd;
 use tokio::signal;
 use tokio::signal::unix::{SignalKind, signal as unix_signal};
 
-const SUSPICIOUS_PREFIXES: &[&str] = &["/tmp"];
-const DETECT_LOG_PATH: &str = "/var/log/needre/needre_detect.log";
+mod config;
+use config::Config;
 
-fn suspicious_prefix(path: &str) -> Option<&'static str> {
-    SUSPICIOUS_PREFIXES.iter().copied().find(|&p| path.starts_with(p))
-}
+const DETECT_LOG_PATH: &str = "/var/log/needre/needre_detect.log";
 
 /// Per-process state tracked in userspace, populated from kernel events.
 #[derive(Debug, Clone, Default)]
@@ -80,6 +78,8 @@ fn format_tree(chain: &[(u32, ProcInfo)]) -> String {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
+
+    let config = Config::load()?;
 
     let rlim = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
@@ -172,14 +172,13 @@ async fn main() -> anyhow::Result<()> {
                             entry.comm = comm.clone();
                             entry.path = path.clone();
 
-                            if let Some(prefix) = suspicious_prefix(&path) {
+                            if config.matching_prefix(&path).is_some() {
                                 let chain = ancestry(&table, event.pid);
                                 let tree = format_tree(&chain);
                                 let ts = Local::now().format("%Y-%m-%d %H:%M:%S");
                                 writeln!(detect_log,
-                                    "{} [DETECT] execution from {} | pid={} tgid={} uid={} comm=\"{}\" path=\"{}\" | tree: {}",
-                                    ts, prefix, event.pid, event.tgid, event.uid, comm, path, tree).ok();
-                                warn!("[DETECT] execution from {prefix} path=\"{path}\" tree: {tree}");
+                                    "{ts} [DETECT] %1000%: executed suspicious process in monitored directory.; tree: {tree}").ok();
+                                warn!("[DETECT] %1000%: executed suspicious process in monitored directory.; tree: {tree}");
                             }
                         }
                         EventType::Exit => {
