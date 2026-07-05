@@ -1,28 +1,85 @@
 use aya::maps::RingBuf;
 use aya::programs::TracePoint;
 use chrono::Local;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::ffi::CStr;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 
-use needre_common::ProcessEvent;
+use needre_common::{EventType, ProcessEvent};
 
 use log::{debug, info, warn};
 use tokio::io::unix::AsyncFd;
 use tokio::signal;
 use tokio::signal::unix::{SignalKind, signal as unix_signal};
 
-const SUSPICIOUS_PREFIXES: &[&str] = &["/tmp"];
+mod config;
+use config::Config;
+
 const DETECT_LOG_PATH: &str = "/var/log/needre/needre_detect.log";
 
-fn suspicious_prefix(path: &str) -> Option<&'static str> {
-    SUSPICIOUS_PREFIXES.iter().copied().find(|&p| path.starts_with(p))
+/// Per-process state tracked in userspace, populated from kernel events.
+#[derive(Debug, Clone, Default)]
+struct ProcInfo {
+    ppid: u32,
+    uid: u32,
+    comm: String,
+    /// Last binary exec'd by this pid (empty until an execve is seen).
+    path: String,
+}
+
+/// Walk the process tree from `start` up towards the root, following the
+/// parent links recorded from fork events. Returns the chain leaf-first.
+fn ancestry(table: &HashMap<u32, ProcInfo>, start: u32) -> Vec<(u32, ProcInfo)> {
+    let mut chain = Vec::new();
+    let mut seen = HashSet::new();
+    let mut cur = start;
+    loop {
+        if !seen.insert(cur) {
+            break; // guard against cycles / pid reuse loops
+        }
+        match table.get(&cur) {
+            Some(info) => {
+                chain.push((cur, info.clone()));
+                if info.ppid == 0 || info.ppid == cur {
+                    break;
+                }
+                cur = info.ppid;
+            }
+            None => {
+                // Ancestor forked before needre started: record the pid only.
+                chain.push((cur, ProcInfo::default()));
+                break;
+            }
+        }
+    }
+    chain
+}
+
+/// Render a process-tree chain (leaf-first) into a readable line.
+fn format_tree(chain: &[(u32, ProcInfo)]) -> String {
+    chain
+        .iter()
+        .map(|(pid, info)| {
+            let what = if !info.path.is_empty() {
+                info.path.clone()
+            } else if !info.comm.is_empty() {
+                info.comm.clone()
+            } else {
+                "?".to_string()
+            };
+            format!("pid={pid}({what})")
+        })
+        .collect::<Vec<_>>()
+        .join(" <- ")
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
+
+    let config = Config::load()?;
 
     let rlim = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
@@ -60,13 +117,22 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let program: &mut TracePoint = ebpf.program_mut("needre").unwrap().try_into()?;
-    program.load()?;
-    program.attach("syscalls", "sys_enter_execve")?;
+    // execve hook: records what binary each process runs.
+    let execve: &mut TracePoint = ebpf.program_mut("needre").unwrap().try_into()?;
+    execve.load()?;
+    execve.attach("syscalls", "sys_enter_execve")?;
+
+    // fork hook: records the parent/child relationship of every new process.
+    let fork: &mut TracePoint = ebpf.program_mut("needre_fork").unwrap().try_into()?;
+    fork.load()?;
+    fork.attach("sched", "sched_process_fork")?;
 
     let ring = RingBuf::try_from(ebpf.map_mut("EVENTS").unwrap())?;
     let mut ring_fd = AsyncFd::new(ring)?;
     let mut sigterm = unix_signal(SignalKind::terminate())?;
+
+    // Process tree / state, keyed by pid, built from the kernel events.
+    let mut table: HashMap<u32, ProcInfo> = HashMap::new();
 
     info!("needre started");
     loop {
@@ -84,14 +150,40 @@ async fn main() -> anyhow::Result<()> {
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default();
 
-                    info!("[EXECVE] pid={} tgid={} uid={} comm=\"{}\" path=\"{}\"",
-                        event.pid, event.tgid, event.uid, comm, path);
+                    match event.event_type {
+                        EventType::Fork => {
+                            debug!("[FORK] pid={} ppid={} uid={} comm=\"{}\"",
+                                event.pid, event.parent_pid, event.uid, comm);
+                            // Record the parent link for the new child. Keep any
+                            // path we may already know for this pid.
+                            let entry = table.entry(event.pid).or_default();
+                            entry.ppid = event.parent_pid;
+                            entry.uid = event.uid;
+                            entry.comm = comm;
+                        }
+                        EventType::Exec => {
+                            info!("[EXECVE] pid={} tgid={} uid={} comm=\"{}\" path=\"{}\"",
+                                event.pid, event.tgid, event.uid, comm, path);
 
-                    if let Some(prefix) = suspicious_prefix(&path) {
-                        let ts = Local::now().format("%Y-%m-%d %H:%M:%S");
-                        writeln!(detect_log,
-                            "{} [DETECT] execution from {} | pid={} tgid={} uid={} comm=\"{}\" path=\"{}\"",
-                            ts, prefix, event.pid, event.tgid, event.uid, comm, path).ok();
+                            // Update this pid's state, preserving the ppid learned
+                            // at fork time (execve does not change the parent).
+                            let entry = table.entry(event.pid).or_default();
+                            entry.uid = event.uid;
+                            entry.comm = comm.clone();
+                            entry.path = path.clone();
+
+                            if config.matching_prefix(&path).is_some() {
+                                let chain = ancestry(&table, event.pid);
+                                let tree = format_tree(&chain);
+                                let ts = Local::now().format("%Y-%m-%d %H:%M:%S");
+                                writeln!(detect_log,
+                                    "{ts} [DETECT] %1000%: executed suspicious process in monitored directory.; tree: {tree}").ok();
+                                warn!("[DETECT] %1000%: executed suspicious process in monitored directory.; tree: {tree}");
+                            }
+                        }
+                        EventType::Exit => {
+                            table.remove(&event.pid);
+                        }
                     }
                 }
                 guard.clear_ready();

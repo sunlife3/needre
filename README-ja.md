@@ -5,7 +5,7 @@ Linux 上で動作する、自作EDRプログラムです。[Aya](https://aya-rs
 - 疑わしいパスのプレフィックス（デフォルト `/tmp`）からの実行を検知します。
 
 ## その他機能
-- タイムスタンプ付きの検知レコードを `/var/log/needre/needre_detect.log` に記録します。
+- 検知内容を `/var/log/needre/needre_detect.log` に記録します。
 - すべての監査ログを journald（`info` レベル）へ出力します。
 -  systemd サービスとして動作します。
 
